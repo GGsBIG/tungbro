@@ -1,0 +1,113 @@
+---
+- hosts: nfs
+  become: true
+  gather_facts: true
+  vars:
+    nfs_export_dir: "/data/nfs"
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在處理 NFS 節點: {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: 安裝 NFS 服務器
+      apt:
+        name: 
+          - nfs-kernel-server
+          - nfs-common
+          - rpcbind
+        state: present
+        update_cache: yes
+      register: nfs_install
+      retries: 3
+      delay: 5
+      until: nfs_install is success
+
+    - name: 確保 rpcbind 服務啟動
+      systemd:
+        name: rpcbind
+        state: started
+        enabled: yes
+
+    - name: 創建 NFS 導出目錄
+      file:
+        path: "{{ nfs_export_dir }}"
+        state: directory
+        mode: '0777'
+        owner: nobody
+        group: nogroup
+
+    - name: 配置 NFS 導出
+      copy:
+        content: |
+          {{ nfs_export_dir }} *(rw,sync,no_subtree_check,no_root_squash,insecure)
+        dest: /etc/exports
+        mode: '0644'
+
+    - name: 確保 rpcbind 服務完全啟動
+      systemd:
+        name: rpcbind
+        state: restarted
+        enabled: yes
+
+    - name: 等待 rpcbind 完全啟動
+      pause:
+        seconds: 3
+
+    - name: 確保 NFS v4 支持
+      copy:
+        content: |
+          [nfsd]
+          threads=8
+          # NFSv4
+          vers4=y
+          vers4.0=y
+          vers4.1=y
+          vers4.2=y
+          # 提高穩定性設定
+          tcp=y
+          udp=y
+          grace=90
+        dest: /etc/nfs.conf
+        mode: '0644'
+        
+    - name: 配置 NFS idmapping
+      copy:
+        content: |
+          [General]
+          Verbosity = 0
+          Domain = localdomain
+
+          [Mapping]
+          Nobody-User = nobody
+          Nobody-Group = nogroup
+        dest: /etc/idmapd.conf
+        mode: '0644'
+
+    - name: 重啟 NFS 服務
+      systemd:
+        name: nfs-kernel-server
+        state: restarted
+        enabled: yes
+
+    - name: 重新導出 NFS 共享
+      shell: exportfs -ra
+
+    - name: 等待 NFS 服務完全啟動
+      pause:
+        seconds: 5
+
+    - name: 顯示 NFS 導出
+      shell: showmount -e localhost
+      register: nfs_exports
+
+    - name: 顯示 NFS 導出結果
+      debug:
+        var: nfs_exports.stdout_lines
+
+    - name: 檢查 NFS 服務狀態
+      shell: systemctl status nfs-kernel-server
+      register: nfs_status
+
+    - name: 顯示 NFS 服務狀態
+      debug:
+        var: nfs_status.stdout_lines 

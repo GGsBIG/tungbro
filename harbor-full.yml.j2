@@ -1,0 +1,142 @@
+# Harbor 完整配置文件
+# 參考：https://github.com/goharbor/harbor/blob/v2.10.0/docs/install-config/harbor-yml-configure.md
+
+# 主機名稱設置
+hostname: {{ harbor_hostname }}
+
+# HTTP 相關配置
+http:
+  port: {{ harbor_http_port }}
+
+# HTTPS 相關配置
+https:
+  port: {{ harbor_https_port }}
+  certificate: {{ harbor_cert_dir }}/harbor.crt
+  private_key: {{ harbor_cert_dir }}/harbor.key
+
+# Harbor 管理員密碼
+harbor_admin_password: {{ harbor_admin_password }}
+
+# 數據庫配置
+database:
+  # 數據庫密碼
+  password: {{ harbor_db_password }}
+  # 最大空閒連接數
+  max_idle_conns: 100
+  # 最大開放連接數
+  max_open_conns: 900
+
+# 數據卷配置
+data_volume: {{ harbor_data_dir }}
+
+# 日誌配置
+log:
+  # 日誌級別：debug, info, warning, error, fatal
+  level: info
+  # 日誌文件輪換次數
+  rotate_count: 50
+  # 日誌文件大小限制
+  rotate_size: 200M
+  # 日誌存儲位置
+  location: {{ harbor_log_dir }}
+
+# 任務服務配置
+jobservice:
+  # 最大工作線程數
+  max_job_workers: 10
+  # 日誌清理持續時間（小時）
+  logger_sweeper_duration: 1
+  # 任務日誌配置
+  job_loggers:
+    - name: "FILE"
+      level: "INFO"
+      settings:
+        base_dir: "{{ harbor_log_dir }}/job_logs"
+    - name: "STDOUT"
+      level: "INFO"
+
+# 通知配置
+notification:
+  # webhook 任務最大重試次數
+  webhook_job_max_retry: 10
+
+# 註冊表配置
+registry:
+  # 存儲服務配置
+  storage_service:
+    # 存儲後端（filesystem, azure, gcs, s3, swift, oss）
+    filesystem:
+      maxthreads: 100
+      rootdirectory: {{ harbor_data_dir }}/registry
+    # 禁用註冊表重定向
+    redirect:
+      disabled: false
+
+# 核心配置
+core:
+  # 加密/解密的密鑰
+  secret: {{ harbor_secret_key }}
+  # 令牌過期時間（分鐘）
+  token_expiration: 30
+  # 本地核心端點 URL
+  local_core_url: http://core:8080
+  # 令牌服務 URL
+  token_service_url: http://core:8080/service/token
+  # 連接遠程註冊表時是否驗證 SSL 證書
+  verify_remote_cert: true
+  # 用於生成 XSRF 令牌的隨機密鑰
+  xsrf_key: {{ lookup('password', '/dev/null chars=ascii_lowercase,digits length=32') }}
+  # XSRF 令牌過期時間（分鐘）
+  xsrf_expiry: 60
+
+# Portal 配置
+portal:
+  # Portal 公共 URL
+  public_url: ""
+
+# 外部 Redis 配置
+external_redis:
+  # Redis 主機
+  host: redis:6379
+  # Redis 密碼
+  password:
+  # Redis 數據庫索引
+  registry_db_index: 1
+  jobservice_db_index: 2
+  trivy_db_index: 5
+  idle_timeout_seconds: 30
+
+# Trivy 配置
+trivy:
+  # 是否啟用 Trivy
+  enabled: {{ enable_trivy | lower }}
+  # 是否跳過修復未確定的漏洞
+  ignore_unfixed: false
+  # 是否跳過 TLS 驗證
+  insecure: false
+  # 漏洞數據庫的 GitHub 鏡像
+  github_token: ""
+  # 掃描超時時間（秒）
+  timeout: 600
+
+# Proxy 配置
+proxy:
+  http_proxy:
+  https_proxy:
+  no_proxy:
+  components:
+    - core
+    - jobservice
+    - trivy
+
+# 指標配置
+metric:
+  # 是否啟用指標
+  enabled: false
+  # Prometheus 推送間隔（秒）
+  interval: 15
+  # Prometheus 服務器地址
+  url:
+
+# 版本號
+_version: 2.10.0 

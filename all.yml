@@ -1,0 +1,41 @@
+---
+# Kubernetes 版本設定
+kubernetes_version: "1.31.0"
+kubernetes_apt_release_channel: stable
+kubernetes_apt_repository: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /"
+
+# 網絡設定
+pod_network_cidr: "192.168.0.0/16"  # Calico 默認的 CIDR
+service_cidr: "10.96.0.0/12"       # Kubernetes 默認
+
+# 容器運行時
+container_runtime: "containerd"
+containerd_version: "1.7.11"
+
+# 控制平面設定
+control_plane_endpoint: "10.6.4.213"  # 第一個 master 節點作為初始控制平面
+control_plane_port: "6443"
+
+# NFS 設定
+nfs_server: "10.6.4.220"
+nfs_export_dir: "/data/nfs"
+nfs_mount_dir: "/mnt/nfs-data"
+
+# Harbor 設定
+harbor_version: "v2.9.0"
+harbor_domain_name: "harbor.tungbro.com"
+harbor_port: "5000"
+harbor_data_dir: "/data/harbor"
+harbor_admin_password: "Harbor12345"  # 生產環境應使用 vault 加密
+
+# 系統設定
+timezone: "Asia/Taipei"
+disable_swap: true
+disable_firewall: true
+
+# CNI 插件選擇
+network_plugin: "calico"  # 使用 Calico 作為 CNI 插件
+
+# Gravity CDC 設定
+gravity_cdc_version: "latest"
+gravity_cdc_data_dir: "/data/gravity" 

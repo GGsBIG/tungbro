@@ -1,0 +1,558 @@
+---
+# 整合的 Harbor 部署腳本
+# 結合 09-harbor.yml 和 09-harbor-client.yml，修改為使用 containerd
+
+- name: 部署 Harbor 容器倉庫
+  hosts: harbor
+  become: yes
+  vars:
+    harbor_domain: "harbor.tungbro.com"
+    harbor_admin_password: "1qaz@WSX"
+    harbor_version: "2.10.0"
+    harbor_data_dir: "/data/harbor"
+    harbor_cert_dir: "/data/cert"
+    harbor_db_password: "root123"
+    harbor_http_port: 80
+    harbor_https_port: 443
+    enable_trivy: true
+  
+  tasks:
+    - name: 顯示部署信息
+      debug:
+        msg: "開始在 {{ inventory_hostname }} ({{ ansible_host }}) 部署 Harbor {{ harbor_version }}"
+
+    - name: 設置 Harbor IP 變量以供客戶端使用
+      set_fact:
+        harbor_ip: "{{ ansible_host }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: 檢查是否已安裝 containerd
+      command: which containerd
+      register: containerd_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: 安裝必要的套件 (避免 docker.io)
+      apt:
+        name: 
+          - wget
+          - openssl
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - python3-pip
+          - software-properties-common
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: yes
+      register: apt_result
+      retries: 3
+      delay: 5
+      until: apt_result is success
+    
+    - name: 添加 Docker 官方 GPG 密鑰
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      register: gpg_result
+      retries: 3
+      delay: 5
+      until: gpg_result is success
+
+    - name: 獲取 Ubuntu 發行版本
+      shell: lsb_release -cs
+      register: ubuntu_release
+      changed_when: false
+
+    - name: 添加 Docker apt 倉庫
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ubuntu_release.stdout }} stable"
+        state: present
+        update_cache: yes
+      register: repo_result
+      retries: 3
+      delay: 5
+      until: repo_result is success
+
+    - name: 安裝 Docker
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+      register: docker_result
+      retries: 3
+      delay: 5
+      until: docker_result is success
+
+    - name: 啟動並啟用 Docker 服務
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+    
+    - name: 安裝 Docker Compose
+      pip:
+        name: docker-compose
+        state: present
+      retries: 3
+      delay: 5
+    
+    - name: 創建 Harbor 所需目錄
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - "{{ harbor_cert_dir }}"
+        - "{{ harbor_data_dir }}"
+        - "{{ harbor_data_dir }}/registry"
+        - "{{ harbor_data_dir }}/database"
+        - "{{ harbor_data_dir }}/redis"
+        - "{{ harbor_data_dir }}/trivy"
+        - "{{ harbor_data_dir }}/jobservice"
+        - "/var/log/harbor"
+        - "/var/log/harbor/job_logs"
+
+    - name: 檢查是否已生成憑證
+      stat:
+        path: "{{ harbor_cert_dir }}/harbor.crt"
+      register: harbor_cert
+    
+    - name: 生成自簽憑證 (有效期 10 年)
+      shell: |
+        openssl req -newkey rsa:4096 -nodes -sha256 -keyout {{ harbor_cert_dir }}/harbor.key \
+        -x509 -days 3650 -out {{ harbor_cert_dir }}/harbor.crt \
+        -subj "/C=TW/ST=Taiwan/L=Taipei/O=tungbro/OU=IT/CN={{ harbor_domain }}" \
+        -addext "subjectAltName = DNS:{{ harbor_domain }},IP:{{ ansible_host }}"
+      when: not harbor_cert.stat.exists
+      args:
+        creates: "{{ harbor_cert_dir }}/harbor.crt"
+    
+    - name: 設置憑證權限
+      file:
+        path: "{{ item.path }}"
+        mode: "{{ item.mode }}"
+        owner: root
+        group: root
+      with_items:
+        - { path: "{{ harbor_cert_dir }}/harbor.crt", mode: '0644' }
+        - { path: "{{ harbor_cert_dir }}/harbor.key", mode: '0600' }
+    
+    - name: 加入憑證至本機受信任清單
+      block:
+        - name: 複製憑證到信任目錄
+          copy:
+            src: "{{ harbor_cert_dir }}/harbor.crt"
+            dest: /usr/local/share/ca-certificates/harbor.crt
+            remote_src: yes
+        
+        - name: 更新 CA 憑證
+          command: update-ca-certificates
+      
+    - name: 修改 /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ ansible_host }} {{ harbor_domain }}"
+        regexp: "{{ harbor_domain }}$"
+        state: present
+    
+    - name: 檢查 Harbor 安裝包是否已存在
+      stat:
+        path: ~/harbor-offline-installer-v{{ harbor_version }}.tgz
+      register: harbor_package
+
+    - name: 下載 Harbor 安裝包
+      get_url:
+        url: "https://github.com/goharbor/harbor/releases/download/v{{ harbor_version }}/harbor-offline-installer-v{{ harbor_version }}.tgz"
+        dest: ~/harbor-offline-installer-v{{ harbor_version }}.tgz
+        timeout: 600
+      register: download_result
+      retries: 3
+      delay: 5
+      until: download_result is succeeded
+      when: not harbor_package.stat.exists
+
+    - name: 解壓 Harbor 安裝包
+      unarchive:
+        src: ~/harbor-offline-installer-v{{ harbor_version }}.tgz
+        dest: ~/
+        remote_src: yes
+        creates: ~/harbor
+
+    - name: 創建 Harbor 配置文件
+      copy:
+        content: |
+          # Configuration file of Harbor
+
+          # The IP address or hostname to access admin UI and registry service.
+          hostname: {{ harbor_domain }}
+
+          # http related config
+          http:
+            # port for http, default is 80. If https enabled, this port will redirect to https port
+            port: {{ harbor_http_port }}
+
+          # https related config
+          https:
+            # https port for harbor, default is 443
+            port: {{ harbor_https_port }}
+            # The path of cert and key files for nginx
+            certificate: {{ harbor_cert_dir }}/harbor.crt
+            private_key: {{ harbor_cert_dir }}/harbor.key
+
+          # The initial password of Harbor admin
+          # It only works in first time to install harbor
+          # Remember Change the admin password from UI after launching Harbor.
+          harbor_admin_password: {{ harbor_admin_password }}
+
+          # Harbor DB configuration
+          database:
+            # The password for the root user of Harbor DB. Change this before any production use.
+            password: {{ harbor_db_password }}
+            # The maximum number of connections in the idle connection pool. If it <=0, no idle connections are retained.
+            max_idle_conns: 50
+            # The maximum number of open connections to the database. If it <= 0, then there is no limit on the number of open connections.
+            max_open_conns: 100
+
+          # The default data volume
+          data_volume: {{ harbor_data_dir }}
+          
+          # Trivy configuration
+          trivy:
+            # Enable or disable Trivy scanner
+            enabled: {{ enable_trivy | lower }}
+            # Skip verifying certificate
+            insecure: false
+            # Ignore unfixed vulnerabilities
+            ignore_unfixed: false
+            
+          # 添加 notification 配置
+          notification:
+            # webhook 通知相關配置
+            webhook_job_max_retry: 10
+            webhook_job_http_client_timeout: 3600
+            
+          # Log configurations
+          log:
+            # options are debug, info, warning, error, fatal
+            level: info
+            # Log files are rotated log_rotate_count times before being removed. If count is 0, old versions are removed rather than rotated.
+            rotate_count: 50
+            # Log files are rotated only if they grow bigger than log_rotate_size bytes. If size is followed by k, the size is assumed to be in kilobytes. 
+            # If the M is used, the size is in megabytes, and if G is used, the size is in gigabytes. So size 100, size 100k, size 100M and size 100G are all valid.
+            rotate_size: 200M
+            # 確保設置 location 屬性
+            location: /var/log/harbor
+            # 確保設置 local 配置
+            local:
+              location: /var/log/harbor
+              rotate_count: 50
+              rotate_size: 200M
+
+          # jobservice configuration
+          jobservice:
+            # Maximum number of job workers in job service
+            max_job_workers: 10
+            # The logger for jobs: "file", "database" or "stdout"
+            job_loggers:
+              - name: "FILE"
+                level: "INFO"
+                settings:
+                  base_dir: "/var/log/harbor/job_logs"
+              - name: "STDOUT"
+                level: "INFO"
+            # The logger sweeper duration
+            logger_sweeper_duration: 1
+            # Job log configurations
+            job_logger_configs:
+              - name: "FILE"
+                level: info
+                settings:
+                  base_dir: /var/log/harbor/job_logs
+                sweeper_duration: 1
+
+          # Core configurations
+          core:
+            # Secret key used for encryption/decryption
+            secret: "{{ lookup('password', '/dev/null chars=ascii_lowercase,digits length=16') }}"
+            # The expiration time (in minutes) of the token generated by core
+            token_expiration: 30
+            # The URL of local core endpoint
+            local_core_url: http://core:8080
+            # The URL for core to talk to token service
+            token_service_url: http://core:8080/service/token
+            # Determine whether the job service should verify the ssl cert when it connects to a remote registry
+            verify_remote_cert: true
+            # The XSRFKey will be used as the random key for generating xsrf token
+            xsrf_key: "{{ lookup('password', '/dev/null chars=ascii_lowercase,digits length=32') }}"
+            # The expiration time (in minutes) of the XSRF token
+            xsrf_expiry: 60
+
+          # Enable chartmuseum
+          chartmuseum:
+            enabled: false
+
+          _version: {{ harbor_version }}
+        dest: ~/harbor/harbor.yml
+        mode: '0644'
+    
+    - name: 確保 Docker 服務運行
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+      ignore_errors: yes
+
+    - name: 運行 Harbor 準備腳本
+      command: 
+        cmd: ./prepare
+        chdir: ~/harbor
+      register: prepare_result
+      ignore_errors: yes
+
+    - name: 顯示準備結果
+      debug:
+        var: prepare_result.stdout_lines
+      when: prepare_result.stdout_lines is defined
+
+    - name: 創建重置腳本
+      copy:
+        content: |
+          #!/bin/bash
+          cd ~/harbor
+          docker-compose down -v
+          rm -rf /var/log/harbor/*
+          rm -rf {{ harbor_data_dir }}/*
+          ./prepare
+          docker-compose up -d
+        dest: ~/harbor/reset-harbor.sh
+        mode: '0755'
+
+    - name: 測試 Harbor 安裝命令
+      command:
+        cmd: ./install.sh --help
+        chdir: ~/harbor
+      register: install_help
+      ignore_errors: yes
+
+    - name: 顯示安裝命令幫助信息
+      debug:
+        var: install_help.stdout_lines
+      when: install_help.stdout_lines is defined
+
+    - name: 安裝 Harbor
+      command:
+        cmd: ./install.sh {% if enable_trivy|bool %}--with-trivy{% endif %}
+        chdir: ~/harbor
+      register: install_result
+      ignore_errors: yes
+
+    - name: 顯示安裝結果
+      debug:
+        var: install_result.stdout_lines
+      when: install_result.stdout_lines is defined
+
+    - name: 重啟 Harbor 服務
+      command:
+        cmd: docker-compose down && docker-compose up -d
+        chdir: ~/harbor
+      ignore_errors: yes
+
+    - name: 等待服務啟動
+      pause:
+        seconds: 30
+        
+    - name: 檢查 Harbor 容器狀態
+      shell: docker ps -a | grep -i harbor || true
+      register: harbor_status
+      ignore_errors: yes
+    
+    - name: 顯示 Harbor 狀態
+      debug:
+        var: harbor_status.stdout_lines
+      ignore_errors: yes
+
+    - name: 部署完成信息
+      debug:
+        msg: 
+          - "Harbor 已成功部署在 {{ harbor_domain }}"
+          - "管理員用戶: admin"
+          - "管理員密碼: {{ harbor_admin_password }}"
+          - "可通過 https://{{ harbor_domain }} 訪問 Harbor 管理界面"
+          - "使用 'docker login {{ harbor_domain }}' 登入 Harbor"
+      
+    - name: 設置 Harbor 主機變量
+      set_fact:
+        harbor_host: "{{ ansible_host }}"
+        harbor_cert_path: "{{ harbor_cert_dir }}/harbor.crt"
+        cacheable: yes
+      
+- name: 配置 Harbor 客戶端
+  hosts: k8s_cluster:nfs
+  become: yes
+  vars:
+    harbor_domain: "harbor.tungbro.com"
+    harbor_ip: "{{ hostvars['localhost']['harbor_ip'] }}"
+    harbor_cert_dir: "/data/cert"
+    harbor_https_port: 443
+  
+  tasks:
+    - name: 安裝 Docker 必要套件
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - gnupg
+        state: present
+        update_cache: yes
+      register: pkg_result
+      retries: 3
+      delay: 5
+      until: pkg_result is success
+
+    - name: 添加 Docker 官方 GPG 密鑰
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      register: gpg_result
+      retries: 3
+      delay: 5
+      until: gpg_result is success
+
+    - name: 獲取 Ubuntu 發行版本
+      shell: lsb_release -cs
+      register: ubuntu_release
+      changed_when: false
+
+    - name: 添加 Docker apt 倉庫
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ubuntu_release.stdout }} stable"
+        state: present
+        update_cache: yes
+      register: repo_result
+      retries: 3
+      delay: 5
+      until: repo_result is success
+
+    - name: 安裝 Docker
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+      register: docker_result
+      retries: 3
+      delay: 5
+      until: docker_result is success
+      
+    - name: 檢查 Docker 服務是否正在運行
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+      ignore_errors: yes
+      register: docker_service_status
+      
+    - name: 顯示 Docker 服務狀態
+      debug:
+        var: docker_service_status
+
+    - name: 修改 /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ harbor_ip }} {{ harbor_domain }}"
+        regexp: "{{ harbor_domain }}$"
+        state: present
+
+    - name: 創建憑證目錄
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - "/etc/docker/certs.d/{{ harbor_domain }}"
+        - "/etc/containerd/certs.d/{{ harbor_domain }}"
+        - "/usr/local/share/ca-certificates"
+
+    - name: 從 Harbor 主機獲取憑證
+      fetch:
+        src: "{{ harbor_cert_dir }}/harbor.crt"
+        dest: /tmp/harbor.crt
+        flat: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      run_once: true
+      ignore_errors: yes
+
+    - name: 複製 Harbor 憑證到客戶端
+      copy:
+        src: /tmp/harbor.crt
+        dest: "{{ item }}"
+        mode: '0644'
+      with_items:
+        - "/etc/docker/certs.d/{{ harbor_domain }}/ca.crt"
+        - "/etc/containerd/certs.d/{{ harbor_domain }}/ca.crt"
+        - "/usr/local/share/ca-certificates/harbor.crt"
+      ignore_errors: yes
+
+    - name: 更新系統憑證
+      command: update-ca-certificates
+      ignore_errors: yes
+
+    - name: 為 containerd 創建 hosts.toml 配置
+      copy:
+        content: |
+          server = "https://{{ harbor_domain }}"
+          
+          [host."https://{{ harbor_domain }}"]
+            ca = "/etc/containerd/certs.d/{{ harbor_domain }}/ca.crt"
+        dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
+        mode: '0644'
+      ignore_errors: yes
+
+    - name: 檢查 Docker 是否已安裝
+      command: which docker
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+      failed_when: false
+
+    - name: 配置 Docker 使用 Harbor
+      copy:
+        content: |
+          {
+            "registry-mirrors": ["https://{{ harbor_domain }}"],
+            "insecure-registries": ["{{ harbor_domain }}:{{ harbor_https_port }}"]
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      register: docker_config
+      ignore_errors: yes
+
+    - name: 創建 Docker 配置目錄
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+      ignore_errors: yes
+
+    - name: 重啟 Docker 服務
+      systemd:
+        name: docker
+        state: restarted
+      when: docker_config is changed
+      ignore_errors: yes
+
+    - name: 檢查 containerd 是否已安裝
+      stat:
+        path: /etc/containerd/config.toml
+      register: containerd_config
+
+    - name: 重啟 containerd 服務
+      systemd:
+        name: containerd
+        state: restarted
+      when: containerd_config.stat.exists
+      ignore_errors: yes 

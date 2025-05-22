@@ -1,0 +1,123 @@
+---
+- hosts: masters[0]
+  become: true
+  gather_facts: true
+  tasks:
+    - name: 檢查是否有 join 命令
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kube_admin_conf
+
+    - name: 獲取加入令牌
+      shell: kubeadm token create --ttl 24h
+      register: token_output
+      when: kube_admin_conf.stat.exists
+      retries: 3
+      delay: 5
+      until: token_output is success
+
+    - name: 獲取 CA 憑證雜湊
+      shell: "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'"
+      register: ca_hash
+      when: kube_admin_conf.stat.exists
+      retries: 3
+      delay: 5
+      until: ca_hash is success
+
+    - name: 上傳 certs 到集群
+      shell: kubeadm init phase upload-certs --upload-certs
+      register: upload_certs
+      when: kube_admin_conf.stat.exists
+      retries: 3
+      delay: 5
+      until: upload_certs is success
+
+    - name: 設置加入命令變數
+      set_fact:
+        join_master_cmd: "kubeadm join {{ ansible_host }}:6443 --token {{ token_output.stdout }} --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} --control-plane --certificate-key {{ upload_certs.stdout_lines[-1] }} --ignore-preflight-errors=all --v=5"
+        join_worker_cmd: "kubeadm join {{ ansible_host }}:6443 --token {{ token_output.stdout }} --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} --ignore-preflight-errors=all --v=5"
+      when: kube_admin_conf.stat.exists and token_output is defined and token_output.stdout is defined and ca_hash is defined and ca_hash.stdout is defined and upload_certs is defined
+
+# 加入其他 master 節點
+- hosts: masters[1:]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 檢查節點是否已加入集群
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: 清理任何現有的 kubernetes 安裝
+      shell: |
+        echo "清理 master 節點上的 Kubernetes 環境..."
+        kubeadm reset -f || true
+        rm -rf /etc/kubernetes/manifests/* || true
+        rm -rf /etc/kubernetes/*.conf || true
+        rm -rf /var/lib/etcd/* || true
+        rm -rf /root/.kube /home/*/.kube || true
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X || true
+        systemctl restart containerd || true
+        sleep 5
+        echo "清理完成"
+      when: not kubelet_conf.stat.exists
+      ignore_errors: true
+
+    - name: 加入主節點到集群
+      shell: "{{ hostvars[groups['masters'][0]]['join_master_cmd'] }}"
+      when: not kubelet_conf.stat.exists and hostvars[groups['masters'][0]]['join_master_cmd'] is defined
+      register: master_join
+      retries: 3
+      delay: 30
+      until: master_join is success
+      ignore_errors: true
+
+    - name: 設置 kubeconfig
+      block:
+        - name: 創建 .kube 目錄 (root 用戶)
+          file:
+            path: /root/.kube
+            state: directory
+            mode: '0755'
+
+        - name: 複製 kubeconfig 到 root 用戶
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+            mode: '0644'
+      when: master_join is success or kubelet_conf.stat.exists
+      ignore_errors: true
+
+# 加入 worker 節點
+- hosts: workers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 檢查節點是否已加入集群
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: 清理任何現有的 kubernetes 安裝
+      shell: |
+        echo "清理 worker 節點上的 Kubernetes 環境..."
+        kubeadm reset -f || true
+        rm -rf /etc/kubernetes/manifests/* || true
+        rm -rf /etc/kubernetes/*.conf || true
+        rm -rf /root/.kube /home/*/.kube || true
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X || true
+        systemctl restart containerd || true
+        sleep 5
+        echo "清理完成"
+      when: not kubelet_conf.stat.exists
+      ignore_errors: true
+
+    - name: 加入工作節點到集群
+      shell: "{{ hostvars[groups['masters'][0]]['join_worker_cmd'] }}"
+      when: not kubelet_conf.stat.exists and hostvars[groups['masters'][0]]['join_worker_cmd'] is defined
+      register: worker_join
+      retries: 3
+      delay: 30
+      until: worker_join is success
+      ignore_errors: true 

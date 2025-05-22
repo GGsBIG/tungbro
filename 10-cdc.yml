@@ -1,0 +1,113 @@
+---
+- hosts: gravity_cdc
+  become: true
+  gather_facts: true
+  vars:
+    cdc_version: "latest"
+    cdc_data_dir: "/opt/gravity-cdc"
+    cdc_port: 8080
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在處理 Gravity CDC 節點: {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: 檢查 apt 鎖狀態
+      shell: lsof /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || echo "No locks"
+      register: apt_locks
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 顯示 apt 鎖狀態
+      debug:
+        var: apt_locks.stdout_lines
+      when: apt_locks.stdout != "No locks"
+
+    - name: 更新系統並安裝依賴
+      shell: DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release python3-pip git unzip
+      register: apt_install_deps
+      retries: 5
+      delay: 10
+      until: apt_install_deps is success
+
+    - name: 顯示依賴安裝結果
+      debug:
+        var: apt_install_deps.stdout_lines
+      when: apt_install_deps.stdout_lines is defined
+
+    - name: 安裝 Docker
+      shell: DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+      register: apt_install_docker
+      retries: 5
+      delay: 10
+      until: apt_install_docker is success
+
+    - name: 顯示 Docker 安裝結果
+      debug:
+        var: apt_install_docker.stdout_lines
+      when: apt_install_docker.stdout_lines is defined
+
+    - name: 啟用 Docker 服務
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: 將用戶添加到 docker 組
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: 安裝 docker-compose
+      pip:
+        name: docker-compose
+        state: present
+
+    - name: 創建 Gravity CDC 目錄
+      file:
+        path: "{{ cdc_data_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: 創建 Gravity CDC 數據目錄
+      file:
+        path: "{{ cdc_data_dir }}/data"
+        state: directory
+        mode: '0755'
+
+    - name: 創建 Gravity CDC 配置目錄
+      file:
+        path: "{{ cdc_data_dir }}/config"
+        state: directory
+        mode: '0755'
+
+    - name: 創建 Gravity CDC docker-compose 文件
+      template:
+        src: templates/gravity-cdc-docker-compose.yml.j2
+        dest: "{{ cdc_data_dir }}/docker-compose.yml"
+        mode: '0644'
+
+    - name: 創建 Gravity CDC 配置文件
+      template:
+        src: templates/gravity-cdc-config.yml.j2
+        dest: "{{ cdc_data_dir }}/config/config.yml"
+        mode: '0644'
+
+    - name: 啟動 Gravity CDC 服務
+      shell: cd {{ cdc_data_dir }} && docker-compose up -d
+      register: cdc_start
+      failed_when: false
+      changed_when: cdc_start.rc == 0
+
+    - name: 顯示 Gravity CDC 啟動結果
+      debug:
+        var: cdc_start.stdout_lines
+
+    - name: 檢查 Gravity CDC 容器狀態
+      shell: docker ps | grep -i gravity-cdc
+      register: cdc_containers
+      changed_when: false
+
+    - name: 顯示 Gravity CDC 容器狀態
+      debug:
+        var: cdc_containers.stdout_lines 

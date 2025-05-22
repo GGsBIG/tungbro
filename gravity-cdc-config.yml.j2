@@ -1,0 +1,33 @@
+server:
+  port: 8080
+
+logging:
+  level:
+    root: INFO
+    io.gravity: DEBUG
+
+datasource:
+  type: mysql
+  host: 127.0.0.1
+  port: 3306
+  database: gravity_cdc
+  username: gravity
+  password: gravity_pass
+
+pipelines:
+  - name: mysql-to-kafka
+    source:
+      type: mysql
+      host: 127.0.0.1
+      port: 3306
+      username: cdc_user
+      password: cdc_pass
+      tables:
+        - database: test_db
+          table: test_table
+    sink:
+      type: kafka
+      bootstrap.servers: 127.0.0.1:9092
+      topic: mysql_changes
+      key.serializer: org.apache.kafka.common.serialization.StringSerializer
+      value.serializer: org.apache.kafka.common.serialization.StringSerializer 

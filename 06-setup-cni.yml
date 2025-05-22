@@ -1,0 +1,86 @@
+---
+- hosts: masters[0]
+  become: true
+  gather_facts: true
+  vars:
+    pod_network_cidr: "{{ hostvars[inventory_hostname].pod_network_cidr | default('192.168.0.0/16') }}"
+    network_plugin: "{{ hostvars[inventory_hostname].network_plugin | default('calico') }}"
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在設置 CNI 網絡: {{ inventory_hostname }} ({{ ansible_host }}) - 使用 {{ network_plugin }} 插件"
+
+    # 設置 Calico 網絡插件
+    - name: 設置 Calico 網絡插件
+      block:
+        - name: 下載 Calico 配置
+          get_url:
+            url: https://docs.projectcalico.org/manifests/calico.yaml
+            dest: /tmp/calico.yaml
+            mode: '0644'
+
+        - name: 應用 Calico 配置
+          shell: kubectl apply -f /tmp/calico.yaml
+          environment:
+            KUBECONFIG: /root/.kube/config
+      when: network_plugin == "calico"
+
+    # 設置 Flannel 網絡插件
+    - name: 設置 Flannel 網絡插件
+      block:
+        - name: 下載 Flannel 配置
+          get_url:
+            url: https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+            dest: /tmp/kube-flannel.yml
+            mode: '0644'
+
+        - name: 修改 Flannel 配置中的 CIDR
+          replace:
+            path: /tmp/kube-flannel.yml
+            regexp: '10\.244\.0\.0/16'
+            replace: "{{ pod_network_cidr }}"
+
+        - name: 應用 Flannel 配置
+          shell: kubectl apply -f /tmp/kube-flannel.yml
+          environment:
+            KUBECONFIG: /root/.kube/config
+      when: network_plugin == "flannel"
+
+    # 確保 CoreDNS 運行正常
+    - name: 確保網絡服務正常運行
+      block:
+        - name: 移除控制平面節點的污點以允許調度普通 Pod
+          shell: |
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- || true
+            kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule- || true
+          environment:
+            KUBECONFIG: /root/.kube/config
+          ignore_errors: yes
+
+        - name: 調整 CoreDNS 資源限制
+          shell: |
+            kubectl -n kube-system get deployment coredns -o yaml | \
+            sed 's/memory: 170Mi/memory: 100Mi/g' | \
+            sed 's/memory: 70Mi/memory: 50Mi/g' | \
+            kubectl apply -f -
+          environment:
+            KUBECONFIG: /root/.kube/config
+          ignore_errors: yes
+
+        - name: 等待 CoreDNS Pod 運行
+          shell: |
+            kubectl -n kube-system wait --for=condition=Ready pods -l k8s-app=kube-dns --timeout=300s
+          environment:
+            KUBECONFIG: /root/.kube/config
+          register: coredns_status
+          ignore_errors: yes
+
+        - name: 驗證網絡連通性
+          shell: |
+            kubectl get nodes -o wide
+            echo "---"
+            kubectl get pods -A -o wide
+          environment:
+            KUBECONFIG: /root/.kube/config
+          register: network_status
+          ignore_errors: yes 

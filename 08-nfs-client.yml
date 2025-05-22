@@ -1,0 +1,203 @@
+---
+# 首先確保所有節點都安裝 NFS 客戶端工具
+- hosts: k8s_cluster
+  become: true
+  gather_facts: true
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在安裝 NFS 客戶端工具: {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: 安裝 NFS 客戶端
+      apt:
+        name: 
+          - nfs-common
+          - rpcbind
+        state: present
+        update_cache: yes
+      register: nfs_client_install
+      retries: 3
+      delay: 5
+      until: nfs_client_install is success
+
+    - name: 啟動並啟用 rpcbind 服務
+      systemd:
+        name: rpcbind
+        state: started
+        enabled: yes
+
+    - name: 檢查 NFS 掛載工具是否存在
+      stat:
+        path: /sbin/mount.nfs
+      register: mount_nfs
+
+    - name: 顯示 NFS 掛載工具狀態
+      debug:
+        msg: "NFS 掛載工具存在: {{ mount_nfs.stat.exists }}"
+
+    - name: 測試 NFS 客戶端連接
+      shell: |
+        echo "測試 NFS 連接..."
+        # 確保在繼續之前 rpcbind 服務正在運行
+        systemctl is-active rpcbind || systemctl restart rpcbind
+        # 加載必要的內核模塊
+        modprobe nfs || echo "NFS 模塊可能已載入"
+        modprobe nfsd || echo "NFSD 模塊可能已載入"
+        
+        # 嘗試檢查 NFS 共享
+        NFS_SERVER_IP="10.6.4.220"
+        echo "測試連接 NFS 服務器: $NFS_SERVER_IP"
+        
+        # 測試連接和可訪問性
+        if showmount -e $NFS_SERVER_IP; then
+          echo "NFS 服務器可訪問"
+        else
+          echo "無法訪問 NFS 服務器，檢查網絡連接和 NFS 服務"
+        fi
+      register: nfs_client_test
+      ignore_errors: yes
+      
+    - name: 顯示 NFS 連接測試結果
+      debug:
+        var: nfs_client_test.stdout_lines
+
+# 然後在 master 節點上部署 NFS 客戶端 provisioner
+- hosts: masters[0]
+  become: true
+  gather_facts: true
+  vars:
+    nfs_server: "10.6.4.220"
+    nfs_path: "/data/nfs"
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在配置 NFS 客戶端 provisioner: {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: 創建 NFS 客戶端 provisioner 配置
+      copy:
+        content: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: nfs-client-provisioner
+          ---
+          kind: ClusterRole
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: nfs-client-provisioner-runner
+          rules:
+            - apiGroups: [""]
+              resources: ["persistentvolumes"]
+              verbs: ["get", "list", "watch", "create", "delete"]
+            - apiGroups: [""]
+              resources: ["persistentvolumeclaims"]
+              verbs: ["get", "list", "watch", "update"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["events"]
+              verbs: ["create", "update", "patch"]
+          ---
+          kind: ClusterRoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: run-nfs-client-provisioner
+          subjects:
+            - kind: ServiceAccount
+              name: nfs-client-provisioner
+              namespace: default
+          roleRef:
+            kind: ClusterRole
+            name: nfs-client-provisioner-runner
+            apiGroup: rbac.authorization.k8s.io
+          ---
+          kind: Role
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: leader-locking-nfs-client-provisioner
+          rules:
+            - apiGroups: [""]
+              resources: ["endpoints"]
+              verbs: ["get", "list", "watch", "create", "update", "patch"]
+          ---
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: leader-locking-nfs-client-provisioner
+          subjects:
+            - kind: ServiceAccount
+              name: nfs-client-provisioner
+              namespace: default
+          roleRef:
+            kind: Role
+            name: leader-locking-nfs-client-provisioner
+            apiGroup: rbac.authorization.k8s.io
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: nfs-client-provisioner
+            labels:
+              app: nfs-client-provisioner
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: nfs-client-provisioner
+            template:
+              metadata:
+                labels:
+                  app: nfs-client-provisioner
+              spec:
+                serviceAccountName: nfs-client-provisioner
+                containers:
+                  - name: nfs-client-provisioner
+                    image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+                    volumeMounts:
+                      - name: nfs-client-root
+                        mountPath: /persistentvolumes
+                    env:
+                      - name: PROVISIONER_NAME
+                        value: k8s-sigs.io/nfs-subdir-external-provisioner
+                      - name: NFS_SERVER
+                        value: "{{ nfs_server }}"
+                      - name: NFS_PATH
+                        value: "{{ nfs_path }}"
+                volumes:
+                  - name: nfs-client-root
+                    nfs:
+                      server: "{{ nfs_server }}"
+                      path: "{{ nfs_path }}"
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: nfs-client
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: k8s-sigs.io/nfs-subdir-external-provisioner
+          parameters:
+            archiveOnDelete: "false"
+        dest: /tmp/nfs-provisioner.yaml
+        mode: '0644'
+
+    - name: 應用 NFS 客戶端 provisioner 配置
+      shell: kubectl apply -f /tmp/nfs-provisioner.yaml
+      register: apply_provisioner
+
+    - name: 等待 NFS 客戶端 provisioner 就緒
+      shell: kubectl wait --for=condition=available --timeout=300s deployment/nfs-client-provisioner
+      register: wait_provisioner
+      ignore_errors: yes
+
+    - name: 顯示 NFS 客戶端 provisioner 狀態
+      shell: kubectl get pods -l app=nfs-client-provisioner -o wide
+      register: provisioner_status
+      ignore_errors: yes
+
+    - name: 輸出 NFS 客戶端 provisioner 狀態
+      debug:
+        var: provisioner_status.stdout_lines 

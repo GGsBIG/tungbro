@@ -1,0 +1,108 @@
+---
+- hosts: masters[0]
+  become: true
+  gather_facts: true
+  vars:
+    dashboard_version: "v2.7.0"
+    metrics_server_version: "v0.6.4"
+    ingress_nginx_version: "controller-v1.9.5"
+  tasks:
+    - name: 安裝 Kubernetes Dashboard
+      block:
+        - name: 下載 Kubernetes Dashboard YAML
+          get_url:
+            url: https://raw.githubusercontent.com/kubernetes/dashboard/{{ dashboard_version }}/aio/deploy/recommended.yaml
+            dest: /tmp/kubernetes-dashboard.yaml
+            mode: '0644'
+
+        - name: 應用 Kubernetes Dashboard
+          shell: kubectl apply -f /tmp/kubernetes-dashboard.yaml
+          register: dashboard_result
+          changed_when: dashboard_result.rc == 0
+
+        - name: 創建 Dashboard 管理員服務帳號
+          shell: |
+            cat <<EOF | kubectl apply -f -
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: admin-user
+              namespace: kubernetes-dashboard
+            EOF
+          register: admin_sa_result
+          changed_when: admin_sa_result.rc == 0
+
+        - name: 創建 Dashboard 管理員角色綁定
+          shell: |
+            cat <<EOF | kubectl apply -f -
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: admin-user
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: cluster-admin
+            subjects:
+            - kind: ServiceAccount
+              name: admin-user
+              namespace: kubernetes-dashboard
+            EOF
+          register: admin_rb_result
+          changed_when: admin_rb_result.rc == 0
+
+        - name: 獲取 Dashboard 訪問令牌
+          shell: kubectl -n kubernetes-dashboard create token admin-user
+          register: dashboard_token
+          changed_when: dashboard_token.rc == 0
+
+        - name: 顯示 Dashboard 訪問令牌
+          debug:
+            var: dashboard_token.stdout
+
+    - name: 安裝 Metrics Server
+      block:
+        - name: 下載 Metrics Server YAML
+          get_url:
+            url: https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ metrics_server_version }}/components.yaml
+            dest: /tmp/metrics-server.yaml
+            mode: '0644'
+
+        - name: 修改 Metrics Server YAML 以禁用 TLS 驗證
+          replace:
+            path: /tmp/metrics-server.yaml
+            regexp: '(\s+)- --secure-port=4443'
+            replace: '\1- --secure-port=4443\n\1- --kubelet-insecure-tls'
+
+        - name: 應用 Metrics Server
+          shell: kubectl apply -f /tmp/metrics-server.yaml
+          register: metrics_result
+          changed_when: metrics_result.rc == 0
+
+    - name: 安裝 Ingress Nginx 控制器
+      block:
+        - name: 下載 Ingress Nginx 控制器 YAML
+          get_url:
+            url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/{{ ingress_nginx_version }}/deploy/static/provider/cloud/deploy.yaml
+            dest: /tmp/ingress-nginx.yaml
+            mode: '0644'
+
+        - name: 應用 Ingress Nginx 控制器
+          shell: kubectl apply -f /tmp/ingress-nginx.yaml
+          register: ingress_result
+          changed_when: ingress_result.rc == 0
+
+        - name: 等待 Ingress Nginx 控制器就緒
+          shell: kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=120s
+          register: ingress_wait
+          failed_when: false
+          changed_when: ingress_wait.rc == 0
+
+    - name: 檢查所有命名空間的 Pod 狀態
+      shell: kubectl get pods --all-namespaces
+      register: all_pods
+      changed_when: false
+
+    - name: 顯示所有 Pod 狀態
+      debug:
+        var: all_pods.stdout_lines 

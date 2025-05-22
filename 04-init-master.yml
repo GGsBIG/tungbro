@@ -1,0 +1,350 @@
+---
+- hosts: masters[0]
+  become: true
+  gather_facts: true
+  vars:
+    network_plugin: "calico"
+    kubernetes_version: "1.31.0"
+    pod_network_cidr: "192.168.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    control_plane_endpoint: "{{ ansible_host | default(ansible_ssh_host) | default(inventory_hostname) }}"
+    control_plane_port: "6443"
+  tasks:
+    - name: 創建 kubeadm 配置目錄
+      file:
+        path: /etc/kubernetes/kubeadm
+        state: directory
+        mode: '0755'
+
+    - name: 創建 kubeadm 配置文件
+      template:
+        src: ../templates/kubeadm-config.yaml.j2
+        dest: /etc/kubernetes/kubeadm/kubeadm-config.yaml
+        mode: '0644'
+
+    - name: 檢查 Kubernetes 集群是否已初始化
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kube_admin_conf
+
+    - name: 初始化前先清理環境（如果必要）
+      shell: |
+        if systemctl is-active kubelet; then
+          echo "Kubelet 正在運行，檢查是否需要重置..."
+          if [ ! -f /etc/kubernetes/admin.conf ] || [ ! -s /etc/kubernetes/admin.conf ]; then
+            echo "發現不完整的 Kubernetes 安裝，執行重置..."
+            kubeadm reset -f
+            rm -rf /etc/kubernetes/*.conf
+            rm -rf /etc/kubernetes/manifests/*
+            rm -rf /var/lib/etcd/*
+            rm -rf $HOME/.kube
+            iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+            echo "清理完成"
+          fi
+        fi
+      when: not kube_admin_conf.stat.exists
+      ignore_errors: true
+
+    - name: 初始化 Kubernetes 集群
+      shell: >
+        kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml 
+        --upload-certs --ignore-preflight-errors=all
+        --v=5
+      register: kubeadm_init
+      when: not kube_admin_conf.stat.exists
+      environment:
+        KUBEADM_TIMEOUT: "10m"
+      retries: 2
+      delay: 30
+      until: kubeadm_init is success
+      ignore_errors: true
+
+    - name: 顯示 kubeadm init 輸出
+      debug:
+        var: kubeadm_init.stdout_lines
+      when: kubeadm_init.stdout_lines is defined
+
+    - name: 設置初始化成功標誌
+      set_fact:
+        init_success: "{{ kube_admin_conf.stat.exists or (kubeadm_init is defined and kubeadm_init.rc is defined and kubeadm_init.rc == 0) }}"
+
+    - name: 設置 kubeconfig 配置
+      block:
+        - name: 創建 .kube 目錄 (root 用戶)
+          file:
+            path: /root/.kube
+            state: directory
+            mode: '0755'
+
+        - name: 複製 kubeconfig 到 root 用戶
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+            mode: '0644'
+
+        - name: 創建一般用戶的 .kube 目錄
+          file:
+            path: /home/{{ ansible_user }}/.kube
+            state: directory
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0755'
+
+        - name: 複製 kubeconfig 到一般用戶
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/{{ ansible_user }}/.kube/config
+            remote_src: yes
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0644'
+
+        - name: 確保用戶 PKI 目錄存在
+          file:
+            path: /home/{{ ansible_user }}/.kube/pki
+            state: directory
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0755'
+
+        - name: 複製 CA 證書到用戶 PKI 目錄
+          copy:
+            src: /etc/kubernetes/pki/ca.crt
+            dest: /home/{{ ansible_user }}/.kube/pki/ca.crt
+            remote_src: yes
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0644'
+
+        - name: 複製所有 PKI 證書到用戶 PKI 目錄
+          shell: cp -R /etc/kubernetes/pki/* /home/{{ ansible_user }}/.kube/pki/
+          args:
+            creates: /home/{{ ansible_user }}/.kube/pki/ca.crt
+
+        - name: 設置 PKI 目錄的正確權限
+          file:
+            path: /home/{{ ansible_user }}/.kube/pki
+            state: directory
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            recurse: yes
+            mode: '0755'
+      when: init_success
+
+    - name: 設置環境變量解決 kubectl 連接問題
+      block:
+        - name: 設置環境變量 (在 .bashrc)
+          blockinfile:
+            path: /home/{{ ansible_user }}/.bashrc
+            block: |
+              export KUBECONFIG=$HOME/.kube/config
+              export KUBERNETES_MASTER=""
+              alias kubectl-unsafe="kubectl --insecure-skip-tls-verify=true"
+              alias kubectl="kubectl --certificate-authority=$HOME/.kube/pki/ca.crt"
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - KUBERNETES ENV"
+            create: yes
+
+        - name: 創建全局環境變量配置
+          copy:
+            content: |
+              # 設置 Kubernetes 環境變量
+              export KUBECONFIG=$HOME/.kube/config
+              # 禁止 kubectl 嘗試連接 localhost:8080
+              export KUBERNETES_MASTER=""
+            dest: /etc/profile.d/kubeconfig.sh
+            mode: '0644'
+      when: init_success
+
+    - name: 獲取加入令牌和憑證信息
+      block:
+        - name: 獲取加入令牌
+          shell: kubeadm token create
+          register: token_output
+
+        - name: 獲取 CA 憑證雜湊
+          shell: "openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'"
+          register: ca_hash
+
+        - name: 上傳 certs 到集群
+          shell: kubeadm init phase upload-certs --upload-certs
+          register: upload_certs
+
+        - name: 設置加入命令變數
+          set_fact:
+            control_plane_join: >-
+              kubeadm join {{ control_plane_endpoint }}:{{ control_plane_port }} 
+              --token {{ token_output.stdout_lines[0] }} 
+              --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout_lines[0] }} 
+              --control-plane 
+              --certificate-key {{ upload_certs.stdout_lines[-1] }} 
+              --ignore-preflight-errors=all
+            worker_join: >-
+              kubeadm join {{ control_plane_endpoint }}:{{ control_plane_port }} 
+              --token {{ token_output.stdout_lines[0] }} 
+              --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout_lines[0] }} 
+              --ignore-preflight-errors=all
+      when: init_success
+
+    # 下載並安裝 Calico 網絡插件
+    - name: 下載 Calico 配置檔案
+      get_url:
+        url: https://docs.projectcalico.org/manifests/calico.yaml
+        dest: /tmp/calico.yaml
+        mode: '0644'
+      register: calico_download
+      when: init_success and network_plugin == "calico"
+
+    - name: 應用 Calico 網絡插件
+      shell: kubectl apply -f /tmp/calico.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: calico_result
+      when: init_success and network_plugin == "calico"
+
+    - name: 檢查 DNS 配置
+      shell: |
+        echo "檢查 CoreDNS 配置..."
+        kubectl -n kube-system get configmap coredns -o yaml || echo "CoreDNS ConfigMap 未找到"
+        kubectl -n kube-system get service kube-dns -o yaml || echo "kube-dns Service 未找到"
+        kubectl -n kube-system get deployment coredns -o yaml || echo "CoreDNS Deployment 未找到"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: dns_check
+      ignore_errors: true
+      when: init_success
+
+    - name: 顯示 DNS 檢查結果
+      debug:
+        var: dns_check.stdout_lines
+      when: dns_check.stdout_lines is defined and init_success
+
+    - name: 確保正確的節點標籤
+      shell: |
+        # 檢查並添加合適的節點標籤
+        for node in $(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name); do
+          if [[ "$node" == *"master"* ]]; then
+            echo "為節點 $node 應用 master 標籤..."
+            kubectl label node $node node-role.kubernetes.io/master= --overwrite || true
+            kubectl label node $node node-role.kubernetes.io/control-plane= --overwrite || true
+          fi
+        done
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+      when: init_success
+
+    - name: 創建自定義 CoreDNS 配置
+      template:
+        src: ../templates/coredns-toleration.yaml.j2
+        dest: /tmp/coredns-toleration.yaml
+        mode: '0644'
+      when: init_success
+
+    - name: 應用 CoreDNS 容忍配置
+      shell: |
+        # 等待 CoreDNS 部署創建完成
+        attempt=0
+        max_attempts=20
+        while [ $attempt -lt $max_attempts ]; do
+          if kubectl -n kube-system get deployment coredns &>/dev/null; then
+            echo "CoreDNS 部署已存在，正在修補..."
+            kubectl -n kube-system patch deployment coredns --patch-file /tmp/coredns-toleration.yaml
+            # 確認修補成功
+            if kubectl -n kube-system get deployment coredns -o yaml | grep -q "node-role.kubernetes.io/master"; then
+              echo "CoreDNS 修補成功！"
+              break
+            else
+              echo "CoreDNS 修補可能未完全應用，重試..."
+            fi
+          else
+            echo "等待 CoreDNS 部署創建完成... (嘗試 $attempt / $max_attempts)"
+            sleep 10
+            attempt=$((attempt+1))
+          fi
+        done
+        
+        if [ $attempt -eq $max_attempts ]; then
+          echo "等待 CoreDNS 部署超時，嘗試強制創建..."
+          # 檢查 manifest 資料夾是否存在
+          if [ -d /etc/kubernetes/manifests ]; then
+            echo "檢查是否需要重啟 kubelet..."
+            systemctl restart kubelet
+            sleep 20
+          fi
+        fi
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: coredns_patch
+      retries: 3
+      delay: 10
+      until: coredns_patch is success
+      ignore_errors: true
+
+    - name: 顯示 CoreDNS 修補結果
+      debug:
+        var: coredns_patch.stdout_lines
+      when: coredns_patch.stdout_lines is defined
+
+    - name: 確保所有節點可調度
+      shell: |
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- || true
+        kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule- || true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+      when: init_success
+
+    - name: 等待 Calico 網絡容器運行
+      shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: calico_wait
+      ignore_errors: yes
+      when: init_success and network_plugin == "calico"
+
+    - name: 等待 CoreDNS 正常運行
+      shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=kube-dns --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: coredns_wait
+      ignore_errors: yes
+      when: init_success
+
+    - name: 檢查 Pod 狀態
+      shell: kubectl get pods -A
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: final_pod_status
+      ignore_errors: yes
+      when: init_success
+
+    - name: 顯示最終 Pod 狀態
+      debug:
+        var: final_pod_status.stdout_lines
+      when: init_success and final_pod_status.stdout_lines is defined 
+    
+    - name: 最終檢查 - 查看集群健康狀態
+      shell: |
+        echo "==== 集群節點狀態 ===="
+        kubectl get nodes
+        echo ""
+        echo "==== 關鍵 Pod 狀態 ===="
+        kubectl get pods -n kube-system
+        echo ""
+        echo "==== 檢查 CoreDNS 日誌 ===="
+        for pod in $(kubectl -n kube-system get pods -l k8s-app=kube-dns -o name); do
+          echo "Pod: $pod 日誌:"
+          kubectl -n kube-system logs $pod --tail=20 || echo "無法獲取日誌"
+          echo ""
+        done
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: final_health_check
+      ignore_errors: yes
+      when: init_success
+      
+    - name: 顯示最終健康檢查結果
+      debug:
+        var: final_health_check.stdout_lines
+      when: init_success and final_health_check.stdout_lines is defined 

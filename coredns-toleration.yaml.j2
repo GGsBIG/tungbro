@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: "CoreDNS"
+spec:
+  # 不修改replicas設定
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+      tolerations:
+      # 預設容忍
+      - key: CriticalAddonsOnly
+        operator: Exists
+      # 明確添加對 control-plane 和 master 節點的容忍
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+        operator: Exists
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+        operator: Exists
+      # 添加更廣泛的容忍以確保 Pod 可以調度
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+      # 特別添加此容忍，確保即使節點有其他污點也能運行
+      - operator: "Exists"
+        effect: "NoSchedule"
+      - operator: "Exists"
+        effect: "NoExecute" 

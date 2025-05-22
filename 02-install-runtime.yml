@@ -1,0 +1,284 @@
+---
+- hosts: k8s_cluster
+  become: true
+  gather_facts: true
+  tasks:
+    - name: 顯示正在處理的主機
+      debug:
+        msg: "正在處理 containerd 節點: {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: 檢查 apt 鎖狀態
+      shell: lsof /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || echo "No locks"
+      register: apt_locks
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 顯示 apt 鎖狀態
+      debug:
+        var: apt_locks.stdout_lines
+      when: apt_locks.stdout != "No locks"
+
+    - name: 安裝必要的套件
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+        update_cache: yes
+      register: basic_pkg_install
+      retries: 3
+      delay: 5
+      until: basic_pkg_install is success
+
+    # 安裝 Containerd 和相關依賴
+    - name: 安裝 Containerd 和相關依賴
+      apt:
+        name:
+          - containerd
+          - runc
+          - nfs-common
+          - rpcbind
+        state: present
+        update_cache: yes
+      register: containerd_install
+      retries: 3
+      delay: 5
+      until: containerd_install is success
+
+    - name: 顯示 Containerd 安裝結果
+      debug:
+        var: containerd_install.stdout_lines
+      when: containerd_install.stdout_lines is defined
+
+    - name: 啟動並啟用 rpcbind 服務
+      systemd:
+        name: rpcbind
+        state: started
+        enabled: yes
+
+    - name: 創建 containerd 配置目錄
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: 創建 containerd certs 目錄
+      file:
+        path: /etc/containerd/certs.d
+        state: directory
+        mode: '0755'
+
+    - name: 檢查 containerd 服務檔案
+      stat:
+        path: /lib/systemd/system/containerd.service
+      register: containerd_service_file
+
+    - name: 顯示 containerd 服務檔案狀態
+      debug:
+        msg: "Containerd 服務檔案存在: {{ containerd_service_file.stat.exists }}"
+
+    - name: 檢查 containerd 執行檔
+      stat:
+        path: /usr/bin/containerd
+      register: containerd_binary
+
+    - name: 顯示 containerd 執行檔狀態
+      debug:
+        msg: "Containerd 執行檔存在: {{ containerd_binary.stat.exists }}"
+
+    - name: 檢查 containerd 服務是否已定義
+      shell: systemctl list-unit-files | grep containerd || echo "未找到 containerd 服務"
+      register: containerd_service_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 顯示 containerd 服務定義狀態
+      debug:
+        var: containerd_service_check.stdout_lines
+
+    # 如果 containerd 服務檔案不存在，則創建
+    - name: 創建 containerd 服務檔案 (如果不存在)
+      copy:
+        content: |
+          [Unit]
+          Description=containerd container runtime
+          Documentation=https://containerd.io
+          After=network.target local-fs.target
+
+          [Service]
+          ExecStartPre=-/sbin/modprobe overlay
+          ExecStart=/usr/bin/containerd
+          Restart=always
+          RestartSec=5
+          Delegate=yes
+          KillMode=process
+          OOMScoreAdjust=-999
+          LimitNOFILE=1048576
+          LimitNPROC=infinity
+          LimitCORE=infinity
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /lib/systemd/system/containerd.service
+        mode: '0644'
+      when: not containerd_service_file.stat.exists
+      register: containerd_service_created
+
+    - name: 顯示 containerd 服務檔案創建結果
+      debug:
+        msg: "Containerd 服務檔案已創建"
+      when: containerd_service_created is changed
+
+    - name: 生成默認 containerd 配置
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+      when: containerd_binary.stat.exists
+      register: containerd_config_generated
+
+    - name: 設置 containerd 使用 systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      when: containerd_binary.stat.exists and (containerd_service_created is changed or containerd_config_generated is changed)
+      register: containerd_config_updated
+
+    - name: 確保 NFS 掛載支持
+      shell: modprobe nfs || echo "NFS module already loaded"
+      ignore_errors: yes
+
+    - name: 確保 NFS 模塊在啟動時載入
+      copy:
+        content: |
+          nfs
+          nfsd
+          sunrpc
+          rpcsec_gss_krb5
+        dest: /etc/modules-load.d/nfs.conf
+        mode: '0644'
+        
+    - name: 確保模塊立即載入
+      shell: |
+        for mod in nfs nfsd sunrpc rpcsec_gss_krb5; do
+          modprobe $mod || echo "無法載入模塊 $mod (可能已載入)"
+        done
+      ignore_errors: yes
+
+    - name: 檢查 containerd 服務狀態
+      command: systemctl status containerd
+      register: containerd_status_check
+      changed_when: false
+      failed_when: false
+      
+    - name: 顯示 containerd 服務詳細狀態
+      debug:
+        msg: "Containerd 服務狀態: {{ containerd_status_check.stdout }}"
+        
+    - name: 檢查 containerd 服務是否被遮罩
+      command: systemctl is-enabled containerd
+      register: containerd_masked
+      changed_when: false
+      failed_when: false
+      
+    - name: 顯示 containerd 服務啟用狀態
+      debug:
+        msg: "Containerd 服務啟用狀態: {{ containerd_masked.stdout | default('未知') }}"
+        
+    - name: 解除遮罩 containerd 服務 (如果被遮罩)
+      command: systemctl unmask containerd
+      when: containerd_masked.stdout is defined and containerd_masked.stdout == 'masked'
+      register: unmask_result
+      
+    - name: 顯示解除遮罩結果
+      debug:
+        msg: "解除遮罩 containerd 服務：成功"
+      when: unmask_result is defined and unmask_result.changed
+      
+    - name: 強制重載 systemd
+      systemd:
+        daemon_reload: yes
+    
+    - name: 停止 containerd 服務 (如果正在運行但可能有問題)
+      command: systemctl stop containerd
+      when: containerd_status_check.rc != 0
+      failed_when: false
+      
+    - name: 啟用 containerd 服務
+      systemd:
+        name: containerd
+        enabled: yes
+        daemon_reload: yes
+      register: containerd_enable
+      ignore_errors: yes
+      
+    - name: 顯示 containerd 啟用結果
+      debug:
+        var: containerd_enable
+      when: containerd_enable is changed
+
+    - name: 重啟 containerd 服務
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+      register: containerd_restart
+      ignore_errors: yes
+      when: containerd_service_created is changed or containerd_config_updated is changed or unmask_result is changed
+
+    - name: 顯示 containerd 重啟結果
+      debug:
+        var: containerd_restart
+      when: containerd_restart is changed
+
+    - name: 等待 containerd 服務啟動
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 60
+      ignore_errors: yes
+      register: containerd_wait
+
+    - name: 顯示 containerd 等待結果
+      debug:
+        var: containerd_wait
+      when: containerd_wait is changed or containerd_wait is failed
+      
+    - name: 檢查 containerd 是否正在運行
+      command: systemctl is-active containerd
+      register: containerd_is_active
+      changed_when: false
+      failed_when: false
+      
+    - name: 顯示 containerd 運行狀態
+      debug:
+        msg: "Containerd 運行狀態: {{ containerd_is_active.stdout }}"
+        
+    - name: 嘗試強制啟動 containerd (如果仍未運行)
+      command: systemctl start containerd
+      when: containerd_is_active.stdout != 'active'
+      register: force_start
+      failed_when: false
+      
+    - name: 最終檢查 containerd 狀態
+      systemd:
+        name: containerd
+      register: final_status
+      ignore_errors: yes
+
+    - name: 顯示 containerd 最終狀態
+      debug:
+        var: final_status
+
+    - name: 檢查 NFS 工具是否安裝正確
+      shell: ls -la /sbin/mount.nfs /sbin/mount.nfs4 || echo "NFS mounts not found"
+      register: nfs_mounts
+      ignore_errors: yes
+
+    - name: 顯示 NFS 工具狀態
+      debug:
+        var: nfs_mounts.stdout_lines 

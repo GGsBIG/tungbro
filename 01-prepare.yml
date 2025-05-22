@@ -1,0 +1,200 @@
+---
+- hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: 設置主機名稱
+      hostname:
+        name: "{{ ansible_host_name }}"
+      when: ansible_host_name is defined
+
+    - name: 更新 /etc/hosts 文件
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          10.6.6.32 bastion
+          10.6.4.213 master-1
+          10.6.4.214 master-2
+          10.6.4.215 master-3
+          10.6.4.217 worker-1
+          10.6.4.218 worker-2
+          10.6.4.219 worker-3
+          10.6.4.220 nfs
+          10.6.4.224 harbor
+          10.6.4.234 gravity-cdc
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - K8S CLUSTER HOSTS"
+
+    - name: 設置時區
+      timezone:
+        name: "Asia/Taipei"
+
+    - name: 檢查是否有 unattended-upgrade 進程運行
+      shell: pgrep unattended-upgrade || echo "No unattended-upgrade process"
+      register: unattended_upgrade_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 顯示 unattended-upgrade 進程狀態
+      debug:
+        msg: "檢測到 unattended-upgrade 進程正在運行：{{ unattended_upgrade_check.stdout }}"
+      when: unattended_upgrade_check.stdout != "No unattended-upgrade process"
+
+    - name: 停止 unattended-upgrade 服務 (如果存在)
+      systemd:
+        name: unattended-upgrades
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+      when: unattended_upgrade_check.stdout != "No unattended-upgrade process"
+
+    - name: 殺掉所有 unattended-upgrade 進程 (如果存在)
+      shell: pkill -9 unattended-upgrade || echo "No process killed"
+      when: unattended_upgrade_check.stdout != "No unattended-upgrade process"
+      ignore_errors: yes
+
+    - name: 等待 dpkg 鎖釋放 (最多等待 180 秒)
+      shell: |
+        for i in $(seq 1 36); do
+          if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+            echo "等待 dpkg 鎖釋放 ($i/36)..."
+            sleep 5
+          else
+            echo "dpkg 鎖已釋放"
+            exit 0
+          fi
+        done
+        echo "等待 dpkg 鎖超時"
+        exit 1
+      register: wait_for_lock
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 清理可能的鎖文件
+      shell: |
+        rm -f /var/lib/apt/lists/lock
+        rm -f /var/lib/dpkg/lock
+        rm -f /var/lib/dpkg/lock-frontend
+        rm -f /var/cache/apt/archives/lock
+        dpkg --configure -a
+      ignore_errors: yes
+
+    - name: 更新 apt 快取
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update
+      retries: 3
+      delay: 5
+      until: apt_update is success
+
+    - name: 檢查可升級的套件數量
+      shell: apt list --upgradable | wc -l
+      register: upgradable_count
+      changed_when: false
+
+    - name: 顯示可升級的套件數量
+      debug:
+        msg: "有 {{ upgradable_count.stdout|int - 1 }} 個套件可以升級"
+      when: upgradable_count.stdout|int > 1
+
+    - name: 顯示可升級的套件列表 (前 10 個)
+      shell: apt list --upgradable | head -11
+      register: upgradable_packages
+      changed_when: false
+      when: upgradable_count.stdout|int > 1
+
+    - name: 顯示可升級的套件
+      debug:
+        var: upgradable_packages.stdout_lines
+      when: upgradable_count.stdout|int > 1
+
+    - name: 安全方式升級關鍵套件
+      apt:
+        name:
+          - apt
+          - dpkg
+          - libc6
+          - python3
+        state: latest
+        update_cache: yes
+      register: apt_upgrade_basic
+      retries: 3
+      delay: 5
+      until: apt_upgrade_basic is success
+      when: ansible_os_family == "Debian"
+
+    - name: 安裝基本套件
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - python3-pip
+          - python3-setuptools
+          - ntp
+          - ntpdate
+          - net-tools
+          - ipvsadm
+          - ipset
+          - jq
+          - vim
+          - git
+          - socat
+          - conntrack
+          - wget
+        state: present
+      register: apt_install
+      retries: 3
+      delay: 5
+      until: apt_install is success
+
+    - name: 禁用 swap
+      shell: swapoff -a
+      when: disable_swap | default(true) | bool
+
+    - name: 移除 swap 從 fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
+        backup: yes
+      when: disable_swap | default(true) | bool
+
+    - name: 啟用必要的內核模塊
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - overlay
+        - br_netfilter
+      ignore_errors: yes
+
+    - name: 設置內核模塊自動加載
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: 設置內核參數
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+      with_items:
+        - {key: "net.bridge.bridge-nf-call-iptables", value: "1"}
+        - {key: "net.bridge.bridge-nf-call-ip6tables", value: "1"}
+        - {key: "net.ipv4.ip_forward", value: "1"}
+
+    - name: 禁用 UFW 防火牆
+      service:
+        name: ufw
+        state: stopped
+        enabled: no
+      when: disable_firewall | default(true) | bool
+      ignore_errors: yes 

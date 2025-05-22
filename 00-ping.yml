@@ -1,0 +1,11 @@
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: 測試所有主機連接
+      ping:
+      register: ping_result
+
+    - name: 顯示連接結果
+      debug:
+        var: ping_result 

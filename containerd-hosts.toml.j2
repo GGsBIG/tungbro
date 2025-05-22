@@ -1,0 +1,5 @@
+server = "https://{{ harbor_domain }}"
+
+[host."https://{{ harbor_domain }}"]
+  ca = "/etc/containerd/certs.d/{{ harbor_domain }}/ca.crt"
+ 

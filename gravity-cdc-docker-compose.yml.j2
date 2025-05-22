@@ -1,0 +1,21 @@
+version: '3'
+
+services:
+  gravity-cdc:
+    image: gravitycdc/gravity-cdc:{{ cdc_version }}
+    container_name: gravity-cdc
+    restart: always
+    ports:
+      - "{{ cdc_port }}:8080"
+    volumes:
+      - {{ cdc_data_dir }}/config:/app/config
+      - {{ cdc_data_dir }}/data:/app/data
+    environment:
+      - TZ=Asia/Taipei
+      - JAVA_OPTS=-Xmx1g
+    networks:
+      - gravity-net
+
+networks:
+  gravity-net:
+    driver: bridge 
